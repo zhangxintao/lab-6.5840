@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,12 +40,9 @@ var taskRequets chan *taskOp
 
 var finishTaskRequests chan *taskFinishOp
 
-var testChan chan bool
-
 type Coordinator struct {
-	// Your definitions here.
-	MapTasks map[string]MapExecution
-	//ReduceTasks map[string]ReduceExecution
+	sync.Mutex
+	MapTasks    map[string]MapExecution
 	ReduceTasks []ReduceExecution
 	NReduce     int
 }
@@ -129,6 +127,8 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
+	c.Lock()
+	defer c.Unlock()
 	return c.mapDone() && c.reduceDone()
 }
 
@@ -187,31 +187,12 @@ func (c *Coordinator) finishTask() {
 		select {
 		case request := <-finishTaskRequests:
 			if request.input.TaskType == Map {
-				task := c.MapTasks[request.input.MapTask.SourceFilename]
-				task.intermediates = request.input.MapTask.IntermediateFiles
-				task.status = Finished
-				c.MapTasks[request.input.MapTask.SourceFilename] = task
+				c.finishMap(request.input.MapTask.SourceFilename, request.input.MapTask.IntermediateFiles)
 				request.result <- true
-
-				if c.mapDone() {
-					// sort all intermediates in MapTasks
-					for _, task := range c.MapTasks {
-						for _, intermediate := range task.intermediates {
-							parts := strings.Split(intermediate, "-")
-							y, err := strconv.Atoi(parts[2])
-							if err != nil {
-								log.Println(err)
-							}
-							c.ReduceTasks[y].intermediateFiles = append(c.ReduceTasks[y].intermediateFiles, intermediate)
-						}
-					}
-				}
 			}
 
 			if request.input.TaskType == Reduce {
-				task := c.ReduceTasks[request.input.ReduceTask.Number]
-				task.status = Finished
-				c.ReduceTasks[request.input.ReduceTask.Number] = task
+				c.finishReduce(request.input.ReduceTask.Number)
 				request.result <- true
 			}
 			continue
@@ -219,18 +200,49 @@ func (c *Coordinator) finishTask() {
 	}
 }
 
+func (c *Coordinator) finishMap(sourceFileName string, intermediateFiles []string) {
+	c.Lock()
+	defer c.Unlock()
+
+	task := c.MapTasks[sourceFileName]
+	task.intermediates = intermediateFiles
+	task.status = Finished
+	c.MapTasks[sourceFileName] = task
+
+	if c.mapDone() {
+		// sort all intermediates in MapTasks
+		for _, task := range c.MapTasks {
+			for _, intermediate := range task.intermediates {
+				parts := strings.Split(intermediate, "-")
+				y, err := strconv.Atoi(parts[2])
+				if err != nil {
+					log.Println(err)
+				}
+				c.ReduceTasks[y].intermediateFiles = append(c.ReduceTasks[y].intermediateFiles, intermediate)
+			}
+		}
+	}
+}
+
+func (c *Coordinator) finishReduce(taskNumber int) {
+	c.Lock()
+	defer c.Unlock()
+
+	task := c.ReduceTasks[taskNumber]
+	task.status = Finished
+	c.ReduceTasks[taskNumber] = task
+}
+
 func (c *Coordinator) tryAssignMap() (string, int) {
+	c.Lock()
+	defer c.Unlock()
 	for filename, mapTask := range c.MapTasks {
-		if mapTask.status == NotStarted {
+		if mapTask.status == NotStarted || (mapTask.status == Started && time.Now().After(mapTask.expireTime)) {
+			log.Printf("assinable task: %+v", filename)
 			mapTask.status = Started
 			mapTask.startedAt = time.Now()
 			mapTask.historyWorkers = append(mapTask.historyWorkers, mapTask.worker)
 			mapTask.result = []KeyValue{}
-			mapTask.expireTime = time.Now().Add(10 * time.Second)
-			c.MapTasks[filename] = mapTask
-			return filename, mapTask.worker
-		} else if mapTask.status == Started && time.Now().After(mapTask.expireTime) {
-			log.Printf("map task expired: %+v", filename)
 			mapTask.expireTime = time.Now().Add(10 * time.Second)
 			c.MapTasks[filename] = mapTask
 			return filename, mapTask.worker
@@ -240,15 +252,13 @@ func (c *Coordinator) tryAssignMap() (string, int) {
 }
 
 func (c *Coordinator) tryAssignReduce() (int, []string) {
+	c.Lock()
+	defer c.Unlock()
 	for i, reduceTask := range c.ReduceTasks {
-		if reduceTask.status == NotStarted && reduceTask.intermediateFiles != nil && len(reduceTask.intermediateFiles) > 0 {
+		if (reduceTask.status == NotStarted && reduceTask.intermediateFiles != nil && len(reduceTask.intermediateFiles) > 0) ||
+			(reduceTask.status == Started && time.Now().After(reduceTask.expireTime)) {
 			reduceTask.status = Started
 			reduceTask.startedAt = time.Now()
-			reduceTask.expireTime = time.Now().Add(10 * time.Second)
-			c.ReduceTasks[i] = reduceTask
-			return i, reduceTask.intermediateFiles
-		} else if reduceTask.status == Started && time.Now().After(reduceTask.expireTime) {
-			log.Printf("reduce task expired: %+v", i)
 			reduceTask.expireTime = time.Now().Add(10 * time.Second)
 			c.ReduceTasks[i] = reduceTask
 			return i, reduceTask.intermediateFiles
