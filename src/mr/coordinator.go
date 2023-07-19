@@ -56,13 +56,12 @@ const (
 )
 
 type MapExecution struct {
-	worker         int
-	status         ExecutionStatus
-	startedAt      time.Time
-	historyWorkers []int
-	result         []KeyValue
-	intermediates  []string
-	expireTime     time.Time
+	worker        int
+	status        ExecutionStatus
+	startedAt     time.Time
+	result        []KeyValue
+	intermediates []string
+	expireTime    time.Time
 }
 
 type ReduceExecution struct {
@@ -70,7 +69,6 @@ type ReduceExecution struct {
 	intermediateFiles []string
 	status            ExecutionStatus
 	startedAt         time.Time
-	historyWorkers    []int
 	expireTime        time.Time
 }
 
@@ -241,7 +239,6 @@ func (c *Coordinator) tryAssignMap() (string, int) {
 			log.Printf("assinable task: %+v", filename)
 			mapTask.status = Started
 			mapTask.startedAt = time.Now()
-			mapTask.historyWorkers = append(mapTask.historyWorkers, mapTask.worker)
 			mapTask.result = []KeyValue{}
 			mapTask.expireTime = time.Now().Add(10 * time.Second)
 			c.MapTasks[filename] = mapTask
@@ -281,9 +278,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	for i, filename := range files {
 		c.MapTasks[filename] = MapExecution{
-			status:         NotStarted,
-			historyWorkers: []int{},
-			worker:         i,
+			status: NotStarted,
+			worker: i,
 		}
 	}
 	taskRequets = make(chan *taskOp)
