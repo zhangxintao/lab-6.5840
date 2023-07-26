@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,12 +28,6 @@ type ByKey []KeyValue
 func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
-type Task struct {
-	taskType   TaskType
-	mapTask    MapTask
-	reduceTask ReduceTask
-}
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -54,45 +49,40 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// uncomment to send the Example RPC to the coordinator.
 	for {
-		task, ok := AskForTask()
+		args := RequestTaskArgs{}
+		reply := RequestTaskReply{}
+		ok := call("Coordinator.RequestTask", &args, &reply)
+
 		if ok {
-			if task.taskType == Map {
-				log.Printf("got map task: %+v", task.mapTask.Number)
-				ProcessMapTask(task, mapf)
+			if reply.TaskType == Map && reply.MapFile != "" {
+				log.Printf("got map task: %+v", reply.TaskId)
+				ProcessMapTask(reply, mapf)
+			} else if reply.TaskType == Reduce && len(reply.IntermediateFiles) > 0 {
+				log.Printf("got reduce task: %+v", reply.TaskId)
+				ProcessReduceTask(reply, reducef)
 			} else {
-				log.Printf("got reduce task: %+v", task.reduceTask.Number)
-				ProcessReduceTask(task, reducef)
+				log.Printf("no task is assigned")
+				break
 			}
 		} else {
 			log.Printf("failed to ask for task")
+			break
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 }
 
-func AskForTask() (Task, bool) {
-	args := RequestTaskArgs{}
-	reply := RequestTaskReply{}
-	ok := call("Coordinator.RequestTask", &args, &reply)
-	if ok {
-		return Task{taskType: reply.TaskType, mapTask: reply.MapTask, reduceTask: reply.ReduceTask}, true
-	} else {
-		log.Printf("failed to ask for task")
-		return Task{}, false
-	}
-}
-
-func AskForFinish(taskType TaskType, mapTask FinishMapTaskArgs, reducueTask FinishReduceTaskArgs) {
-	args := FinishTaskArgs{TaskType: taskType, MapTask: mapTask, ReduceTask: reducueTask}
+func AskForFinish(taskId int, taskType TaskType, intermediateFiles []string) {
+	args := FinishTaskArgs{TaskId: taskId, TaskType: taskType, IntermediateFiles: intermediateFiles}
 	reply := FinishTaskReply{}
 	ok := call("Coordinator.FinishTask", &args, &reply)
 	if !ok {
-		log.Printf("failed to ask for finish task")
+		log.Printf("failed to finish task")
 	}
 }
 
-func ProcessMapTask(task Task, mapf func(string, string) []KeyValue) {
-	filename := task.mapTask.Filename
+func ProcessMapTask(task RequestTaskReply, mapf func(string, string) []KeyValue) {
+	filename := task.MapFile
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -103,17 +93,13 @@ func ProcessMapTask(task Task, mapf func(string, string) []KeyValue) {
 	}
 	file.Close()
 	kva := mapf(filename, string(content))
-	log.Printf("kv: %+v", kva)
-	openFiles := make([]*os.File, task.mapTask.BucketNo)
-	var intermediates []string
+	openFiles := make([]*os.File, task.NReduce)
 	for _, kv := range kva {
-		bucket := ihash(kv.Key) % task.mapTask.BucketNo
+		bucket := ihash(kv.Key) % task.NReduce
 		if openFiles[bucket] == nil {
-			targetFileName := strings.Join([]string{"mr", strconv.Itoa(task.mapTask.Number), strconv.Itoa(bucket)}, "-")
-			log.Printf("creating file %v", targetFileName)
-			openFiles[bucket], err = os.Create(targetFileName)
-			intermediates = append(intermediates, targetFileName)
-			defer openFiles[bucket].Close()
+			targetFileName := strings.Join([]string{"mr", strconv.Itoa(task.TaskId), strconv.Itoa(bucket)}, "-")
+			openFiles[bucket], err = ioutil.TempFile("", targetFileName+"."+"*")
+			log.Printf("created temp file for %v, tmp file:%v", targetFileName, openFiles[bucket].Name())
 			if err != nil {
 				log.Fatalf("cannot create %v", targetFileName)
 			}
@@ -124,13 +110,24 @@ func ProcessMapTask(task Task, mapf func(string, string) []KeyValue) {
 			log.Fatalf("cannot write %v", kv)
 		}
 	}
+	var intermediates []string
+	workingPath, _ := os.Getwd()
+	for _, file := range openFiles {
+		// rename temp file to target file
+		if file != nil {
+			realName := filepath.Join(workingPath, strings.Split(filepath.Base(file.Name()), ".")[0])
+			log.Printf("renaming %v to %v", file.Name(), realName)
+			os.Rename(file.Name(), realName)
+			intermediates = append(intermediates, filepath.Base(realName))
+		}
+	}
 
-	AskForFinish(Map, FinishMapTaskArgs{SourceFilename: filename, IntermediateFiles: intermediates}, FinishReduceTaskArgs{})
+	AskForFinish(task.TaskId, task.TaskType, intermediates)
 }
 
-func ProcessReduceTask(task Task, reducef func(string, []string) string) {
+func ProcessReduceTask(task RequestTaskReply, reducef func(string, []string) string) {
 	intermediate := []KeyValue{}
-	for _, intermediateFile := range task.reduceTask.IntermediateFiles {
+	for _, intermediateFile := range task.IntermediateFiles {
 		file, err := os.Open(intermediateFile)
 		if err != nil {
 			log.Fatalf("cannot open %v", intermediateFile)
@@ -146,8 +143,8 @@ func ProcessReduceTask(task Task, reducef func(string, []string) string) {
 		file.Close()
 	}
 	sort.Sort(ByKey(intermediate))
-	oname := "mr-out-" + strconv.Itoa(task.reduceTask.Number)
-	ofile, _ := os.Create(oname)
+	oname := "mr-out-" + strconv.Itoa(task.TaskId)
+	ofile, _ := os.CreateTemp("", oname+"."+"*")
 
 	//
 	// call Reduce on each distinct key in intermediate[],
@@ -171,9 +168,13 @@ func ProcessReduceTask(task Task, reducef func(string, []string) string) {
 		i = j
 	}
 
-	ofile.Close()
+	workingPath, _ := os.Getwd()
+	realName := filepath.Join(workingPath, strings.Split(filepath.Base(ofile.Name()), ".")[0])
+	log.Printf("reduce, rename %+v to %+v", ofile.Name(), realName)
+	os.Rename(ofile.Name(), realName)
+	//ofile.Close()
 
-	AskForFinish(Reduce, FinishMapTaskArgs{}, FinishReduceTaskArgs{Number: task.reduceTask.Number})
+	AskForFinish(task.TaskId, task.TaskType, nil)
 }
 
 //

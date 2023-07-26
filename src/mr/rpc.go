@@ -12,20 +12,20 @@ import (
 )
 
 type RequestTaskArgs struct {
-	WorkerId int
 }
 
 type RequestTaskReply struct {
-	Assigned   bool
-	TaskType   TaskType
-	MapTask    MapTask
-	ReduceTask ReduceTask
+	TaskId            int
+	TaskType          TaskType
+	MapFile           string
+	IntermediateFiles []string
+	NReduce           int
 }
 
 type FinishTaskArgs struct {
-	TaskType   TaskType
-	MapTask    FinishMapTaskArgs
-	ReduceTask FinishReduceTaskArgs
+	TaskType          TaskType
+	TaskId            int
+	IntermediateFiles []string
 }
 
 type FinishTaskReply struct {
@@ -41,22 +41,12 @@ type FinishReduceTaskArgs struct {
 	Number int
 }
 
-type MapTask struct {
-	Filename string
-	BucketNo int
-	Number   int
-}
-
-type ReduceTask struct {
-	IntermediateFiles []string
-	Number            int
-}
-
 type TaskType int64
 
 const (
 	Map TaskType = iota
 	Reduce
+	NoTask
 )
 
 // Add your RPC definitions here.

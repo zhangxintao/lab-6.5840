@@ -3,6 +3,7 @@ package mr
 import (
 	"errors"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/rpc"
@@ -13,38 +14,12 @@ import (
 	"time"
 )
 
-type taskOpResult struct {
-	workerId        int
-	taskType        TaskType
-	mapTaskParam    MapTask
-	reduceTaskParam ReduceTask
-	assigned        bool
-}
-
-type taskOp struct {
-	result chan taskOpResult
-}
-
-type taskFinishOp struct {
-	result chan bool
-	input  FinishTaskArgs
-}
-
-type taskFinishOpResult struct {
-	taskType        TaskType
-	mapTaskParam    FinishMapTaskArgs
-	reduceTaskParam FinishReduceTaskArgs
-}
-
-var taskRequets chan *taskOp
-
-var finishTaskRequests chan *taskFinishOp
-
 type Coordinator struct {
 	sync.Mutex
-	MapTasks    map[string]MapExecution
-	ReduceTasks []ReduceExecution
-	NReduce     int
+	TaskPool  map[int]CoordinatorTask
+	NReduce   int
+	NMap      int
+	TaskQueue chan CoordinatorTask
 }
 
 type ExecutionStatus int64
@@ -55,53 +30,118 @@ const (
 	Finished
 )
 
-type MapExecution struct {
-	worker        int
-	status        ExecutionStatus
-	startedAt     time.Time
-	result        []KeyValue
-	intermediates []string
-	expireTime    time.Time
-}
+type CoordinatorTaskType int64
 
-type ReduceExecution struct {
-	worker            int
-	intermediateFiles []string
+const (
+	MapTask CoordinatorTaskType = iota
+	ReduceTask
+)
+
+type CoordinatorTask struct {
+	id                int
+	taskType          TaskType
 	status            ExecutionStatus
-	startedAt         time.Time
-	expireTime        time.Time
+	timeout           time.Time
+	mapSourceFile     string
+	intermediateFiles []string
 }
 
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
-	if !c.Done() {
-		var op = taskOp{result: make(chan taskOpResult)}
-		taskRequets <- &op
-		var result = <-op.result
-		if !result.assigned {
-			return errors.New("task pending")
-		}
-		reply.TaskType = result.taskType
-		reply.MapTask = result.mapTaskParam
-		reply.ReduceTask = result.reduceTaskParam
-
+	if c.Done() {
+		reply.TaskType = NoTask
 		return nil
 	}
 
-	return errors.New("No more task")
+	task, ok := <-c.TaskQueue
+	c.Lock()
+	defer c.Unlock()
+	if ok {
+		log.Printf("to assign task: %+v", task)
+		reply.TaskType = task.taskType
+		reply.TaskId = task.id
+		reply.MapFile = task.mapSourceFile
+		reply.IntermediateFiles = task.intermediateFiles
+		reply.NReduce = c.NReduce
+		task.status = Started
+		task.timeout = time.Now().Add(10 * time.Second)
+		if task.taskType == Map {
+			c.TaskPool[task.id] = task
+		} else {
+			c.TaskPool[c.NMap+task.id] = task
+		}
+		return nil
+	} else {
+		log.Printf("no more task available in channel")
+		reply.TaskType = NoTask
+		return nil
+	}
 }
 
 func (c *Coordinator) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) error {
-	if !c.Done() {
-		var finishTaskop = taskFinishOp{result: make(chan bool), input: *args}
-		finishTaskRequests <- &finishTaskop
-		var result = <-finishTaskop.result
-		if result {
-			log.Printf("Successfully finished task: %+v", args)
-			return nil
+	if c.Done() {
+		return nil
+	}
+
+	c.Lock()
+	defer c.Unlock()
+	log.Printf("finishing task:%+v, type:%v", args.TaskId, args.TaskType)
+	index := args.TaskId
+	if args.TaskType == Reduce {
+		index += c.NMap
+	}
+
+	if c.TaskPool[index].taskType == Map {
+		if args.IntermediateFiles == nil || len(args.IntermediateFiles) == 0 {
+			return errors.New("no intermediate files")
+		}
+		for _, intermediate := range args.IntermediateFiles {
+			parts := strings.Split(intermediate, "-")
+			y, err := strconv.Atoi(parts[2])
+			if err != nil {
+				log.Println(err)
+			}
+			mapKey := c.NMap + y
+			task, ok := c.TaskPool[mapKey]
+			if !ok {
+				task = CoordinatorTask{id: y, taskType: Reduce, status: NotStarted, intermediateFiles: []string{}}
+			}
+			task.intermediateFiles = append(task.intermediateFiles, intermediate)
+			c.TaskPool[mapKey] = task
+			log.Printf("added reduce task:%+v, mapKey:%+v, source:%+v", y, c.NMap+y, intermediate)
+		}
+		delete(c.TaskPool, args.TaskId)
+		log.Printf("done map: %+v, remaining:%+v", args.TaskId, len(c.TaskPool))
+		if c.mapDone() {
+			c.prepareReduceTasks()
+		}
+	} else {
+		mapKey := c.NMap + args.TaskId
+		delete(c.TaskPool, mapKey)
+		log.Printf("done reduce: %+v,  remaining:%+v", args.TaskId, len(c.TaskPool))
+	}
+	return nil
+}
+
+func (c *Coordinator) mapDone() bool {
+	for _, task := range c.TaskPool {
+		if task.taskType == Map {
+			log.Printf("found map hasn't done: +%v, sourceFile:%+v", task.id, task.mapSourceFile)
+			return false
 		}
 	}
-	return errors.New("finish error")
+
+	return true
+}
+
+func (c *Coordinator) prepareReduceTasks() {
+	for _, reduceTask := range c.TaskPool {
+		if reduceTask.taskType == Reduce && reduceTask.status == NotStarted {
+			c.TaskQueue <- reduceTask
+		} else {
+			log.Fatalf("found non-reduce task while preparing for reduce")
+		}
+	}
 }
 
 //
@@ -127,141 +167,29 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	c.Lock()
 	defer c.Unlock()
-	return c.mapDone() && c.reduceDone()
+
+	log.Printf("check done:%v", len(c.TaskPool))
+	return len(c.TaskPool) == 0
 }
 
-func (c *Coordinator) mapDone() bool {
-	if len(c.MapTasks) == 0 {
-		return false
-	}
-
-	for _, mapTask := range c.MapTasks {
-		if mapTask.status != Finished {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Coordinator) reduceDone() bool {
-	if len(c.ReduceTasks) == 0 {
-		return false
-	}
-
-	for _, reduceTask := range c.ReduceTasks {
-		if reduceTask.status != Finished {
-			return false
-		}
-	}
-	return true
-}
-
-func (c *Coordinator) assignTask() {
+func (c *Coordinator) checkTimeout() {
 	for {
-		if c.Done() {
-			break
-		}
-		select {
-		case request := <-taskRequets:
-			mapTask, workerId := c.tryAssignMap()
-			if mapTask != "" {
-				request.result <- taskOpResult{assigned: true, taskType: Map, mapTaskParam: MapTask{Filename: mapTask, BucketNo: c.NReduce, Number: workerId}}
-				continue
-			}
-
-			reduceTask, intermediateFiles := c.tryAssignReduce()
-			if reduceTask != -1 {
-				log.Printf("assign reduce task: %+v, files:%+v", reduceTask, intermediateFiles)
-				request.result <- taskOpResult{assigned: true, taskType: Reduce, reduceTaskParam: ReduceTask{IntermediateFiles: intermediateFiles, Number: reduceTask}}
-				continue
-			}
-			request.result <- taskOpResult{assigned: false}
-		}
-	}
-}
-
-func (c *Coordinator) finishTask() {
-	for {
-		select {
-		case request := <-finishTaskRequests:
-			if request.input.TaskType == Map {
-				c.finishMap(request.input.MapTask.SourceFilename, request.input.MapTask.IntermediateFiles)
-				request.result <- true
-			}
-
-			if request.input.TaskType == Reduce {
-				c.finishReduce(request.input.ReduceTask.Number)
-				request.result <- true
-			}
-			continue
-		}
-	}
-}
-
-func (c *Coordinator) finishMap(sourceFileName string, intermediateFiles []string) {
-	c.Lock()
-	defer c.Unlock()
-
-	task := c.MapTasks[sourceFileName]
-	task.intermediates = intermediateFiles
-	task.status = Finished
-	c.MapTasks[sourceFileName] = task
-
-	if c.mapDone() {
-		// sort all intermediates in MapTasks
-		for _, task := range c.MapTasks {
-			for _, intermediate := range task.intermediates {
-				parts := strings.Split(intermediate, "-")
-				y, err := strconv.Atoi(parts[2])
-				if err != nil {
-					log.Println(err)
+		c.Lock()
+		for id, task := range c.TaskPool {
+			if task.status == Started {
+				log.Printf("checking timeout for task:%+v, timeout at:%+v", task.id, task.timeout)
+				if task.timeout.Before(time.Now()) {
+					log.Printf("task timeout: %+v", task)
+					task.timeout = time.Now().Add(10 * time.Second)
+					task.status = NotStarted
+					c.TaskPool[id] = task
+					c.TaskQueue <- task
 				}
-				c.ReduceTasks[y].intermediateFiles = append(c.ReduceTasks[y].intermediateFiles, intermediate)
 			}
 		}
+		c.Unlock()
+		time.Sleep(1 * time.Second)
 	}
-}
-
-func (c *Coordinator) finishReduce(taskNumber int) {
-	c.Lock()
-	defer c.Unlock()
-
-	task := c.ReduceTasks[taskNumber]
-	task.status = Finished
-	c.ReduceTasks[taskNumber] = task
-}
-
-func (c *Coordinator) tryAssignMap() (string, int) {
-	c.Lock()
-	defer c.Unlock()
-	for filename, mapTask := range c.MapTasks {
-		if mapTask.status == NotStarted || (mapTask.status == Started && time.Now().After(mapTask.expireTime)) {
-			log.Printf("assinable task: %+v", filename)
-			mapTask.status = Started
-			mapTask.startedAt = time.Now()
-			mapTask.result = []KeyValue{}
-			mapTask.expireTime = time.Now().Add(10 * time.Second)
-			c.MapTasks[filename] = mapTask
-			return filename, mapTask.worker
-		}
-	}
-	return "", -1
-}
-
-func (c *Coordinator) tryAssignReduce() (int, []string) {
-	c.Lock()
-	defer c.Unlock()
-	for i, reduceTask := range c.ReduceTasks {
-		if (reduceTask.status == NotStarted && reduceTask.intermediateFiles != nil && len(reduceTask.intermediateFiles) > 0) ||
-			(reduceTask.status == Started && time.Now().After(reduceTask.expireTime)) {
-			reduceTask.status = Started
-			reduceTask.startedAt = time.Now()
-			reduceTask.expireTime = time.Now().Add(10 * time.Second)
-			c.ReduceTasks[i] = reduceTask
-			return i, reduceTask.intermediateFiles
-		}
-	}
-	return -1, []string{}
 }
 
 //
@@ -271,23 +199,28 @@ func (c *Coordinator) tryAssignReduce() (int, []string) {
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		MapTasks:    make(map[string]MapExecution),
-		ReduceTasks: make([]ReduceExecution, nReduce),
-		NReduce:     nReduce,
+		TaskPool:  make(map[int]CoordinatorTask),
+		TaskQueue: make(chan CoordinatorTask, int(math.Max(float64(len(files)), float64(nReduce)))),
+		NReduce:   nReduce,
+		NMap:      len(files),
 	}
+	log.Printf("coordinator inited")
 
 	for i, filename := range files {
-		c.MapTasks[filename] = MapExecution{
-			status: NotStarted,
-			worker: i,
-		}
+		c.TaskPool[i] = CoordinatorTask{id: i, taskType: Map, status: NotStarted, mapSourceFile: filename}
 	}
-	taskRequets = make(chan *taskOp)
-	finishTaskRequests = make(chan *taskFinishOp)
+	log.Printf("task pool created")
 
-	go c.assignTask()
-	go c.finishTask()
+	for _, task := range c.TaskPool {
+		log.Printf("pushing task:%+v", task)
+		c.TaskQueue <- task
+	}
+	log.Printf("task queued")
+
+	go c.checkTimeout()
 
 	c.server()
+	path, _ := os.Getwd()
+	log.Printf("coordinator started, %+v, current: %+v", os.TempDir(), path)
 	return &c
 }
