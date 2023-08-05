@@ -70,6 +70,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	applyCh   chan ApplyMsg
 
 	// persistent state on all servers
 	currentTerm int
@@ -93,6 +94,7 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// Your code here (2A).
+	DLog(dTrace, rf.me, "GetState - currentTerm:%v, role:%v", rf.currentTerm, rf.role)
 	return rf.currentTerm, rf.role == Leader
 }
 
@@ -271,12 +273,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.role == Leader {
 		// in a valid raft impl, there should not any case that 2 leaders exist in a term even when one of them are not aware of it
 		DLog(dError, rf.me, "%v:detected another leader:%v for term:%v", funcName, args.LeaderId, rf.currentTerm)
+		return
 	}
 
+	// handle heartbeat
+	/*
+		if len(args.Entries) == 0 {
+			DLog(dTrace, rf.me, "%v:heartbeat", funcName)
+			reply.Term = rf.currentTerm
+			reply.Success = true
+			return
+		}
+	*/
+	// handle log replication
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		DLog(dTrace, rf.me, "%v:log mismatch", funcName)
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// check if an existing entry conflicts with a new one (same index but different terms)
+	// delete the existing entry and all that follow it
+	// append any new entries not already in the log
+	DLog(dTrace, rf.me, "%v:log match, count of entries to append:%v", funcName, len(args.Entries))
+	rf.log = rf.log[:args.PrevLogIndex+1]
+	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
-	// only handle hearbeat for 2A
+	// if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		DLog(dTrace, rf.me, "%v:leaderCommit > commitIndex", funcName)
+		rf.commitIndex = args.LeaderCommit
+		if rf.commitIndex > len(rf.log)-1 {
+			DLog(dTrace, rf.me, "%v:commitIndex > len(rf.log)-1", funcName)
+			rf.commitIndex = len(rf.log) - 1
+		}
+
+		// apply log entries that have not been applied
+		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
+			DLog(dTrace, rf.me, "%v:apply log entry:%v", funcName, rf.log[rf.lastApplied])
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastApplied].Command,
+				CommandIndex: rf.lastApplied,
+			}
+		}
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -297,12 +343,23 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	DLog(dTrace, rf.me, "try to start agreement on the next command:%v", command)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
+	if rf.role != Leader {
+		return index, term, isLeader
+	}
 
 	// Your code here (2B).
-
+	// append the command to the log
+	DLog(dTrace, rf.me, "appending the command to log:%v", command)
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	index = len(rf.log) - 1
+	term = rf.currentTerm
+	isLeader = true
 	return index, term, isLeader
 }
 
@@ -410,26 +467,48 @@ func (rf *Raft) startAppendEntries() {
 		if i == rf.me {
 			continue
 		}
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: rf.nextIndex[i] - 1,
-			PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
-			Entries:      rf.log[rf.nextIndex[i]:],
-			LeaderCommit: rf.commitIndex,
+		// if last log index >= nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+		// if successful: update nextIndex and matchIndex for follower
+		// if AppendEntries fails because of log inconsistency: decrement nextIndex and retry
+		// if there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+
+		var args AppendEntriesArgs
+		if len(rf.log)-1 < rf.nextIndex[i] {
+			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, heartbeat", i)
+			// [Q]: what should be the value for PrevLogINdex and PrevLogTerm for heartbeat?
+			// [A]: make them reflect the last entry of leader's log
+			args = AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: len(rf.log) - 1,
+				PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+				Entries:      []LogEntry{},
+				LeaderCommit: rf.commitIndex,
+			}
+		} else {
+			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, log:%v", i, rf.log[rf.nextIndex[i]:])
+			args = AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: rf.nextIndex[i] - 1,
+				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+				Entries:      rf.log[rf.nextIndex[i]:],
+				LeaderCommit: rf.commitIndex,
+			}
 		}
+
 		go func(server int, appendEntriesArgs AppendEntriesArgs) {
 			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, args:%v", server, appendEntriesArgs)
 			reply := &AppendEntriesReply{}
 			ok := rf.sendAppendEntries(server, &appendEntriesArgs, reply)
 			if ok {
-				rf.handleAppendEntriesReply(reply)
+				rf.handleAppendEntriesReply(appendEntriesArgs, reply, server)
 			}
 		}(i, args)
 	}
 }
 
-func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
+func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEntriesReply, server int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
@@ -442,7 +521,54 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply) {
 	}
 	if reply.Success {
 		// update nextIndex and matchIndex for follower
-		DLog(dLeader, rf.me, "handleAppendEntriesReply")
+		DLog(dLeader, rf.me, "handleAppendEntriesReply for success")
+		if rf.nextIndex[server] < args.PrevLogIndex+len(args.Entries)+1 {
+			DLog(dLeader, rf.me, "handleAppendEntriesReply - update nextIndex and matchIndex for server:%v", server)
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
+			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			// if there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
+			for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+				count := 1
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					if rf.matchIndex[i] >= N {
+						count++
+					}
+				}
+				if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+					DLog(dLeader, rf.me, "handleAppendEntriesReply - update commitIndex to:%v", N)
+					rf.commitIndex = N
+					break
+				}
+			}
+			for rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				DLog(dLeader, rf.me, "handleAppendEntriesReply - apply log entry:%v", rf.log[rf.lastApplied])
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied,
+				}
+			}
+			// [Q]: why do we need to update commitIndex here?
+			// [A]: because we may have appended new entries to the log, and we need to check if we can commit any of them
+		}
+	} else {
+		// decrement nextIndex and retry
+		DLog(dLeader, rf.me, "handleAppendEntriesReply for fail")
+		if rf.nextIndex[server] > 1 {
+			DLog(dLeader, rf.me, "handleAppendEntriesReply - decrement nextIndex for server:%v", server)
+			if rf.nextIndex[server] < len(rf.log) {
+				// back to previous term
+				for rf.nextIndex[server] > 1 && rf.log[rf.nextIndex[server]-1].Term == rf.log[rf.nextIndex[server]].Term {
+					rf.nextIndex[server]--
+				}
+			} else {
+				rf.nextIndex[server]--
+			}
+		}
 	}
 }
 
@@ -461,6 +587,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
