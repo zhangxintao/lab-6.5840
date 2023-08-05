@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 
 	//	"6.5840/labgob"
 
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -108,32 +110,39 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	funcName := "persist"
+	DLog(dTrace, rf.me, "%v:persisting", funcName)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+	DLog(dTrace, rf.me, "%v:persisted", funcName)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+	funcName := "readPersist"
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		DLog(dWarn, rf.me, "%v:invalid input data", funcName)
 		return
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		DLog(dWarn, rf.me, "%v:no value found", funcName)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -245,15 +254,16 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int
+	XIndex  int
+	XLen    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	funcName := "AppendEntries"
-	DLog(dTrace, rf.me, "%v; args:%v", funcName, args)
-	rf.timeout = getNextTimeout()
-	DLog(dTrace, rf.me, "%v; timeout reset", funcName)
+	DLog(dTrace, rf.me, "%v; args len:%v", funcName, len(args.Entries))
 
 	if args.Term < rf.currentTerm {
 		DLog(dTrace, rf.me, "%v:lower term detected: %v", funcName, args.Term)
@@ -261,6 +271,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+
+	rf.timeout = getNextTimeout()
+	DLog(dTrace, rf.me, "%v; timeout reset", funcName)
 
 	if args.Term > rf.currentTerm {
 		DLog(dTrace, rf.me, "%v:higher term detected: %v", funcName, args.Term)
@@ -276,20 +289,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// handle heartbeat
-	/*
-		if len(args.Entries) == 0 {
-			DLog(dTrace, rf.me, "%v:heartbeat", funcName)
-			reply.Term = rf.currentTerm
-			reply.Success = true
-			return
-		}
-	*/
 	// handle log replication
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DLog(dTrace, rf.me, "%v:log mismatch", funcName)
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		if args.PrevLogIndex >= len(rf.log) {
+			reply.XLen = len(rf.log)
+		} else {
+			reply.XTerm = rf.log[args.PrevLogIndex].Term
+			reply.XIndex = args.PrevLogIndex
+			for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == reply.XTerm {
+				reply.XIndex--
+			}
+		}
 		return
 	}
 
@@ -357,6 +370,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// append the command to the log
 	DLog(dTrace, rf.me, "appending the command to log:%v", command)
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	rf.persist()
 	index = len(rf.log) - 1
 	term = rf.currentTerm
 	isLeader = true
@@ -432,6 +446,10 @@ func (rf *Raft) startElection() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				DLog(dVote, rf.me, "startelection - requestVote - process result")
+				if rf.currentTerm != args.Term {
+					DLog(dVote, rf.me, "start election - current term:%v is different from args term:%v", rf.currentTerm, args.Term)
+					return
+				}
 				if reply.Term > rf.currentTerm {
 					DLog(dVote, rf.me, "start election - requestVote to: s%v, higher term detected: %v", server, reply.Term)
 					rf.currentTerm = reply.Term
@@ -486,7 +504,7 @@ func (rf *Raft) startAppendEntries() {
 				LeaderCommit: rf.commitIndex,
 			}
 		} else {
-			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, log:%v", i, rf.log[rf.nextIndex[i]:])
+			DLog(dLeader, rf.me, "startAppendEntries - to:s%v", i)
 			args = AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -498,7 +516,7 @@ func (rf *Raft) startAppendEntries() {
 		}
 
 		go func(server int, appendEntriesArgs AppendEntriesArgs) {
-			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, args:%v", server, appendEntriesArgs)
+			DLog(dLeader, rf.me, "startAppendEntries - to:s%v, args len:%v", server, len(appendEntriesArgs.Entries))
 			reply := &AppendEntriesReply{}
 			ok := rf.sendAppendEntries(server, &appendEntriesArgs, reply)
 			if ok {
@@ -511,6 +529,12 @@ func (rf *Raft) startAppendEntries() {
 func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEntriesReply, server int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	if rf.currentTerm != args.Term {
+		DLog(dWarn, rf.me, "handleAppendEntriesReply - current term:%v is different from args term:%v", rf.currentTerm, args.Term)
+		return
+	}
+
 	if reply.Term > rf.currentTerm {
 		DLog(dLeader, rf.me, "handleAppendEntriesReply - higer term:%v detected", reply.Term)
 		rf.currentTerm = reply.Term
@@ -519,13 +543,15 @@ func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEn
 		rf.persist()
 		return
 	}
+
 	if reply.Success {
 		// update nextIndex and matchIndex for follower
 		DLog(dLeader, rf.me, "handleAppendEntriesReply for success")
 		if rf.nextIndex[server] < args.PrevLogIndex+len(args.Entries)+1 {
 			DLog(dLeader, rf.me, "handleAppendEntriesReply - update nextIndex and matchIndex for server:%v", server)
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
-			rf.matchIndex[server] = rf.nextIndex[server] - 1
+			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+			//rf.matchIndex[server] = rf.nextIndex[server] - 1
 			// if there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N
 			for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 				count := 1
@@ -538,6 +564,7 @@ func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEn
 					}
 				}
 				if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+					// commitment can only be determined by current term.
 					DLog(dLeader, rf.me, "handleAppendEntriesReply - update commitIndex to:%v", N)
 					rf.commitIndex = N
 					break
@@ -562,12 +589,49 @@ func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEn
 			DLog(dLeader, rf.me, "handleAppendEntriesReply - decrement nextIndex for server:%v", server)
 			if rf.nextIndex[server] < len(rf.log) {
 				// back to previous term
+				startPosition := rf.nextIndex[server]
+				// back nextIndex to the last item of last term
+				rf.nextIndex[server]--
 				for rf.nextIndex[server] > 1 && rf.log[rf.nextIndex[server]-1].Term == rf.log[rf.nextIndex[server]].Term {
 					rf.nextIndex[server]--
 				}
+				DLog(dTrace, rf.me, "batch backing up:%v positions", startPosition-rf.nextIndex[server])
 			} else {
+				DLog(dTrace, rf.me, "single backing up")
 				rf.nextIndex[server]--
 			}
+
+			// back depends on XTerm and XIndex
+			/*
+				if reply.XLen > 0 {
+					DLog(dLeader, rf.me, "handleAppendEntriesReply - back to XLen:%v", reply.XLen)
+					rf.nextIndex[server] = reply.XLen
+				} else {
+					DLog(dLeader, rf.me, "handleAppendEntriesReply - back to XTerm:%v, XIndex:%v", reply.XTerm, reply.XIndex)
+					// check whether leader has the entry with XTerm
+					foundXTerm := false
+					for i := len(rf.log) - 1; i > 0; i-- {
+						if rf.log[i].Term == reply.XTerm {
+							DLog(dLeader, rf.me, "handleAppendEntriesReply - found XTerm:%v at index:%v", reply.XTerm, i)
+							foundXTerm = true
+							break
+						}
+					}
+					if foundXTerm {
+						// found leader's last entry with XTerm
+						for i := len(rf.log) - 1; i > 0; i-- {
+							if rf.log[i].Term == reply.XTerm {
+								DLog(dLeader, rf.me, "handleAppendEntriesReply - found XTerm:%v at index:%v", reply.XTerm, i)
+								rf.nextIndex[server] = i
+								break
+							}
+						}
+					} else {
+						// leader does not have entry with XTerm
+						rf.nextIndex[server] = reply.XIndex
+					}
+				}
+			*/
 		}
 	}
 }
