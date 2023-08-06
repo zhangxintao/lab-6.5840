@@ -200,6 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			rf.persist()
+			rf.timeout = getNextTimeout()
 			return
 		} else {
 			DLog(dTrace, rf.me, "RequestVote - vote not granted.")
@@ -272,9 +273,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.timeout = getNextTimeout()
-	DLog(dTrace, rf.me, "%v; timeout reset", funcName)
-
 	if args.Term > rf.currentTerm {
 		DLog(dTrace, rf.me, "%v:higher term detected: %v", funcName, args.Term)
 		rf.currentTerm = args.Term
@@ -289,20 +287,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.timeout = getNextTimeout()
+	DLog(dTrace, rf.me, "%v; timeout reset", funcName)
+
 	// handle log replication
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		DLog(dTrace, rf.me, "%v:log mismatch", funcName)
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		if args.PrevLogIndex >= len(rf.log) {
-			reply.XLen = len(rf.log)
-		} else {
-			reply.XTerm = rf.log[args.PrevLogIndex].Term
-			reply.XIndex = args.PrevLogIndex
-			for reply.XIndex > 0 && rf.log[reply.XIndex-1].Term == reply.XTerm {
-				reply.XIndex--
-			}
-		}
 		return
 	}
 
@@ -446,7 +438,7 @@ func (rf *Raft) startElection() {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
 				DLog(dVote, rf.me, "startelection - requestVote - process result")
-				if rf.currentTerm != args.Term {
+				if rf.currentTerm != args.Term || rf.role == Leader {
 					DLog(dVote, rf.me, "start election - current term:%v is different from args term:%v", rf.currentTerm, args.Term)
 					return
 				}
@@ -530,7 +522,7 @@ func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEn
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm != args.Term {
+	if rf.currentTerm != args.Term || rf.role != Leader {
 		DLog(dWarn, rf.me, "handleAppendEntriesReply - current term:%v is different from args term:%v", rf.currentTerm, args.Term)
 		return
 	}
