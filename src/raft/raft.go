@@ -456,11 +456,6 @@ func (rf *Raft) startElection() {
 					if votes > len(rf.peers)/2 {
 						DLog(dVote, rf.me, "requestVote - get majority")
 						rf.role = Leader
-						// initialize nextIndex and matchIndex
-						for i := 0; i < len(rf.peers); i++ {
-							rf.nextIndex[i] = len(rf.log)
-							rf.matchIndex[i] = 0
-						}
 						// send initial empty AppendEntries RPCs (heartbeat) to each server
 						go rf.startAppendEntries()
 					}
@@ -592,38 +587,6 @@ func (rf *Raft) handleAppendEntriesReply(args AppendEntriesArgs, reply *AppendEn
 				DLog(dTrace, rf.me, "single backing up")
 				rf.nextIndex[server]--
 			}
-
-			// back depends on XTerm and XIndex
-			/*
-				if reply.XLen > 0 {
-					DLog(dLeader, rf.me, "handleAppendEntriesReply - back to XLen:%v", reply.XLen)
-					rf.nextIndex[server] = reply.XLen
-				} else {
-					DLog(dLeader, rf.me, "handleAppendEntriesReply - back to XTerm:%v, XIndex:%v", reply.XTerm, reply.XIndex)
-					// check whether leader has the entry with XTerm
-					foundXTerm := false
-					for i := len(rf.log) - 1; i > 0; i-- {
-						if rf.log[i].Term == reply.XTerm {
-							DLog(dLeader, rf.me, "handleAppendEntriesReply - found XTerm:%v at index:%v", reply.XTerm, i)
-							foundXTerm = true
-							break
-						}
-					}
-					if foundXTerm {
-						// found leader's last entry with XTerm
-						for i := len(rf.log) - 1; i > 0; i-- {
-							if rf.log[i].Term == reply.XTerm {
-								DLog(dLeader, rf.me, "handleAppendEntriesReply - found XTerm:%v at index:%v", reply.XTerm, i)
-								rf.nextIndex[server] = i
-								break
-							}
-						}
-					} else {
-						// leader does not have entry with XTerm
-						rf.nextIndex[server] = reply.XIndex
-					}
-				}
-			*/
 		}
 	}
 }
