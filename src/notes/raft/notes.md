@@ -12,14 +12,14 @@ design:
 
 Tests
 2A
-
-![Alt text](image.png)
+![Alt text](image-4.png)
 
 2B
-Individuals:
-1. VERBOSE=1 go test -run BasicAgree | dslogs -c 3 > test.log
-2. VERBOSE=1 go test -run RPCBytes | dslogs -c 3 > test.log
-![Alt text](image-1.png)
+![Alt text](image-3.png)
+
+2C
+python3 dstest 2C -n 500 -p 200
+![Alt text](image-2.png)
 
 2C
 major issue
@@ -38,3 +38,11 @@ has the **index out of range** issue
 apply error: commit index=117 server=4 3431 != server=0 7996
 exit status 1
 FAIL    6.5840/raft     36.421s
+
+2D
+* only append entries when nextIndex is in log
+* otherwise, send snapshot
+* when done send snapshot, update nextIndex and matchIndex
+
+* make sure the snapshot never exceed lastApplied
+* since commitIndex >= lastApplied, so log compaction will never compact the log entry that is not committed
