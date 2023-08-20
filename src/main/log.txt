@@ -1,0 +1,7 @@
+*** Starting crash test.
+unexpected EOF
+unexpected EOF
+sort mr-out* | grep . > mr-crash-all
+comparing mr-out* with mr-correct-crash.txt
+--- crash test: PASS
+*** PASSED ALL TESTS
